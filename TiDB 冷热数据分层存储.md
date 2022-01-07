@@ -8,72 +8,66 @@
 
 ## 项目介绍
 
-TiDB冷热数据分层存储主要考虑的是热数据存放在TiKV上以及很少几率查询分析的冷数据（如银行、电商几年前或者十几年前的数据）存放到便宜通用的云存储S3上，同时使S3存储引擎支持TiDB相关计算下推（如谓词下推、聚合下推等），实现TiDB基于S3冷数据分析查询。
+**以极简单的方式实现冷热数据分离，冷数据保存在s3外部表中**
 
-主要功能：
+针对普通表：实现**insert into select**的方式完成冷热数据分离：
 
-- 实现TiDB基于S3表支持所有的算子。
-- 实现S3存储引擎支持算子下推。
-- 实现TPCH所有SQL查询基于S3查询都能正确返回，同时性能下降可接受。
-- 实现S3上的冷表与TiKV的热表支持任意方式关联查询。
+            - 支持创建**s3**外部表
+            - 支持通过**insert into s3_table select from tikv_table where ...** ，把**tikv** 内部表的数据转储到**s3**对象存储上
+
+- 支持通过**insert into tikv_table select from s3_table where ...** ，把**s3**外部表的数据转储到**tikv**内部表，
+
+**针对分区表：自动完成分片表转化成s3外部表，保留主表和s3外部表的主从关系**
+
+支持通过**Alter** 分区表操作，把**tikv** 内部分区表的数据自动转储到对应的**s3**外部表中，自动完成以下几件事：
+
+- 内部**tikv**分区表数据转存到**s3**对象存储中
+
+- 更改分区表元数据，把**tikv**内部分区表转化成**s3**外部表，核心要点要保留**s3**外部表和主表的分区关系
+
+- 删除**tikv**内部分区表数据
+
+转换后**s3**外部分区表对用户完全透明，对用户来说，**s3**外部表就是主表的一个分片表。例如针对主表的查询结果包含部分**tikv**内部分片表以及部分**s3**外部表对应的分片表数据，那么返回的结果就会来自两部分：tikv内部分片表，以及**s3**外部表
+
+**保证用户使用s3外部表和tikv内部表没有任何区别**
+
+- **s3** 外部表支持所有的数据类型
+- **s3**外部表支持所有的算子
+- 优化**s3**外部表操作性能在用户可接受的范围内
+
+通过支持谓词(逻辑运算、比较运算、数值运算），聚合函数、Limit等算子下推到S3节点，利用s3的计算能力提升查询性能。
 
 ## 背景&动机
 
-TiDB是一款HTAP数据库，在云上销售产品最重要的因素之一就是成本，TiDB对于存量冷数据做AP查询主要使用Tiflash组件，Tiflash的数据又是从TiKV实时同步，对于PB级的事务要求不高存量冷数据，使用Tiflash与TiKV保存冷数据将消耗大量的计算与存储资源，不利于TiDB在云上销售，如果能使用一种更便宜更通用的存储介质实现冷数据查询，将大大的降低TiDB在云上的成本。
-为了解决TiDB在云上冷数据的查询成本问题，我们提出了TiDB冷热数据分层存储解决方案，让TiKV，Tiflash解决热数据交易型与分析型查询，让通用便宜的云存储S3解决TiDB冷数据查询。
+我们团队是做云数据库服务开发，降低用户在云上使用数据库的成本是我们一直追求的目标。 随着用户数据量的持续增长，我们发现存储成本占数据库总成本的比率越来越高。因此我们选择冷热数据分层存储降低存储成本
+
+
 
 ## 项目设计
 
-### 系统整体架构如下：
-
-![1640594715100](C:\Users\SHENZH~1\AppData\Local\Temp\1640594715100.png)
-
-
-
 ## 详细设计
 
-### 本提案的实现分为三层：
+为了实现冷热数据分离，并且达到期望所有效果，我们开发修改了TIDB一些模块：
 
-- TiDB外部表部分查询算子下推：
+**SQL Parser模块,系统表模块:**
 
-  实现TiDB冷数据S3外部表存储，同时修改TiDB外部表元数据使查询支持谓词下推（逻辑运算、比较运算、数值运算） 、 支持聚合函数下推、支持Limit算子下推等操作到虚拟层Virtual。
+- 增加一个新的系统表，用于保存s3元数据， 每一条记录对应一个s3存储元数据：包含s3的endpoint,  access key, secret key， s3 bucket。
+  insert into mysql.serverobject  values("s3object","http://192.168.117.220:9000","minioadmin", "minioadmin","s3bucket");
 
-- TiDB下推算子转化s3相关查询：
+- 支持创建外部表，相比普通表增加了s3option 选型，对应s3元数据对象，外部表对应s3的存储路径：Bucketname/DBName/TableName
+  create table s3_table(id1 int8,id2 char(30)) s3options s3object; 
 
-  虚拟层Virtual对于TiDB下推的算子进行并发查询与汇总。
+- 支持分片表自动转换成s3外部表   
 
-- S3计算引擎执行查询：
+  Alter table employees alter partition employees_01 s3options s3object
 
-  利用S3支持sql查询能力，返回相关sql查询结果。
+**执行器模块：**
 
-### 设计元数据表存储S3相关信息：
+- 能够区分操作表是否是s3外部表，如果是外部表，写入时，数据以256M 为粒度保存到s3的一个对象中 , 当查询s3 外部表时，s3对象会被以流式的方式装配到chunk中，以支持上层算子操作
+- 支持算子下推到s3节点，利用s3节点的计算能力加速s3外部表的性能
+- s3 外部表支持所有的数据类型，存储在s3的数据按s3外部表的schema对应的数据类型保存到chunk里，相关列都会基于数据类型编码
+- 支持Alter 实现内部分片表数据自动转储到s3 外部表中，同时保留主表和s3外部表的主从关系不变
 
-设计S3相关信息serverhost，serverobject存储在mysql database下。
+**优化器模块：**
 
-insert into mysql.serverobject values("tests3","eos-wuxi-1.cmecloud.cn","accesskey
-","secretkey","bucketname");
-
-insert into mysql.serverhost values("eos-wuxi-1.cmecloud.cn","10.10.10.1:80");
-
-### 实现冷数据DML & DDL相关操作:
-
-支持TiDB支持建外部表存储在S3上，支持对s3表执行TRUNCATE TABLE、DROP TABLE、CREATE TABLE，同时支持数据库导入与导出：
-
-//tidb支持创建s3外部表语法
-
-create table tests3(id int, name varchar(20)) s3options tests3;
-其中，s3options后面跟的tests3就是第一步添加到系统表mysql.serverobject中的name值
-
-//tidb普通表
-
-create table test(id int, name varchar(20));
-
-//导入数据到S3用户表上：
-insert into tests3 select * from test;
-
-//S3数据导入普通表
-
-insert into test select * from tests3;
-
-支持tpch所有查询
-
+- 少量无法下推s3的算子，我们修改了优化器阻止这部分算子下推。 当前不支持的算子，主要就是包含TopN 算子
