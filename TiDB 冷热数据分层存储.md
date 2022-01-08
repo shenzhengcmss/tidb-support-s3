@@ -12,8 +12,8 @@
 
 针对普通表：实现**insert into select**的方式完成冷热数据分离：
 
-            - 支持创建**s3**外部表
-            - 支持通过**insert into s3_table select from tikv_table where ...** ，把**tikv** 内部表的数据转储到**s3**对象存储上
+- 支持创建**s3**外部表
+- 支持通过**insert into s3_table select from tikv_table where ...** ，把**tikv** 内部表的数据转储到**s3**对象存储上
 
 - 支持通过**insert into tikv_table select from s3_table where ...** ，把**s3**外部表的数据转储到**tikv**内部表，
 
@@ -41,6 +41,7 @@
 
 我们团队是做云数据库服务开发，降低用户在云上使用数据库的成本是我们一直追求的目标。 随着用户数据量的持续增长，我们发现存储成本占数据库总成本的比率越来越高。因此我们选择冷热数据分层存储降低存储成本
 
+![image](https://github.com/shenzhengcmss/tidb-support-s3/blob/main/tidb-for-s3.png)
 
 
 ## 项目设计
